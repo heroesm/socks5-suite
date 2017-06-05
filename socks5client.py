@@ -1,7 +1,5 @@
 #! /usr/bin/env python3
 #TODO: add GSSAPI support
-#TODO: test socks5 binding
-#TODO: test username/password authentication
 
 import socket
 from collections import namedtuple
@@ -9,7 +7,6 @@ import struct
 import re
 import http.client
 import urllib.request
-#import ssl
 
 # used as the default value for username/password subnegotiation
 USERNAME = '';
@@ -65,8 +62,8 @@ _PT_SOCKS5 = 'socks5'
 
 # socks5 command
 _SC_CONNECT = b'\x01'
-_SC_BIND = b'\x03';
-_SC_UDP = b'\x04';
+_SC_BIND = b'\x02';
+_SC_UDP = b'\x03';
 
 # connection status
 _CS_INIT = 'initialised';
@@ -87,16 +84,25 @@ def readSock(sock, nSize):
         sock.settimeout(None);
     bData = b'';
     while len(bData) < nSize:
-        bData += sock.recv(nSize - len(bData));
+        bRecv = sock.recv(nSize - len(bData));
+        if (bRecv):
+            bData += bRecv;
+        else:
+            raise DeadConnectionError('socks5 connection lost');
     sock.settimeout(oriTimeout);
     return bData;
 
 def writeSock(sock, bData):
     return sock.sendall(bData);
 
-class GeneralError(Exception): pass
+class GeneralError(Exception):
+    pass
 
-class Socks5Error(Exception): pass
+class DeadConnectionError(Exception):
+    pass
+
+class Socks5Error(Exception):
+    pass
 
 class Socket(socket.socket):
     # base class prevent that socket.socket is overwritten in executuion
@@ -210,14 +216,14 @@ class Socks(Socket):
         PwdRes = namedtuple('PwdRes', ('ver', 'status'));
         bRes = readSock(self.negoSock, 2);
         pwdRes = PwdRes(*struct.unpack('>cc', bRes));
-        if (pwdRes.ver == b'\x00'):
+        if (pwdRes.ver == b'\x01'):
             if (pwdRes.status == b'\x00'):
                 # authentication pass
                 return True;
             else:
                 raise Socks5Error('authentication failed');
         else:
-            raise GeneralError('unexpected ver field in authentication response')
+            raise Socks5Error('unexpected ver field in authentication response')
         
 
     def socks5SubNegotiate(self, bMethod):
@@ -244,8 +250,7 @@ class Socks(Socket):
             raise GeneralError('socket not connected');
         bVer = SOCKS5VER;
         bNmethods = bytes([len(bMethods)]);
-        nego = Socks5Nego(bVer, bNmethods, bMethods);
-        bNego = b''.join(nego);
+        bNego = b''.join((bVer, bNmethods, bMethods));
         writeSock(sock, bNego);
         return True;
 
@@ -296,8 +301,7 @@ class Socks(Socket):
             bAtyp = IPV4TYPE;
             bDstaddr = socket.inet_aton(socket.gethostbyname(sDstHost))
         bDstport = struct.pack('>H', nDstPort);
-        request = Socks5Req(SOCKS5VER, bCmd, SOCKS5RSV, bAtyp, bDstaddr, bDstport);
-        bReq = b''.join(request);
+        bReq = b''.join((SOCKS5VER, bCmd, SOCKS5RSV, bAtyp, bDstaddr, bDstport));
         return writeSock(sock, bReq);
 
     def _recvReply(self):
@@ -319,16 +323,16 @@ class Socks(Socket):
             sAddr = socket.inet_ntoa(bAddr);
         elif (atyp == b'\x03'):
             # domain name
-            nAddrLength = readSock(sock, 1);
+            nAddrLength = ord(readSock(sock, 1));
             bAddr = readSock(sock, nAddrLength);
             sAddr = socket.gethostbyname(bAddr);
         elif (atyp == b'\x04'):
             # ipv6 address
             raise Socks5Error('ipv6 is not supported');
         else:
-            raise GeneralError('unexpected reply');
+            raise Socks5Error('unexpected reply');
         port = readSock(sock, 2);
-        nPort = struct.unpack('>H', port);
+        nPort = struct.unpack('>H', port)[0];
         return (sAddr, nPort);
 
     def socks5Request(self, bCmd, aDstAddr, isRemoteDns=True):
@@ -352,6 +356,8 @@ class Socks(Socket):
             aAnyAddr = ('0.0.0.0', 0)
             self.socks5Request(_SC_UDP, aAnyAddr, False);
         assert self.status == _CS_REP;
+        if (self.aBndAddr[0] == '0.0.0.0'):
+            self.aBndAddr[0] == self.aSrvAddr[0];
         sock = self.udpSock;
         bRsv = b'\x00\x00';
         bFrag = b'\x00';
@@ -368,9 +374,8 @@ class Socks(Socket):
             bAtyp = IPV4TYPE;
             bDstaddr = socket.inet_aton(socket.gethostbyname(sDstHost))
         bDstport = struct.pack('>H', nDstPort);
-        udp = Socks5Udp(bRsv, bFrag, bAtyp, bDstaddr, bDstport, bData);
-        bUdp = b''.join(udp);
-        return writeSock(sock, bUdp);
+        bUdp = b''.join((bRsv, bFrag, bAtyp, bDstaddr, bDstport, bData));
+        return sock.sendto(bUdp, self.aBndAddr);
 
     def _recvUdp(self, bufsize):
         #o  if ATYP is X'01' - 10+method_dependent octets smaller
@@ -380,34 +385,47 @@ class Socks(Socket):
         assert self.type == socket.SOCK_DGRAM;
         assert self.udpSock;
         assert self.status == _CS_REP;
+        # suppose the socks5 server only return ip address type, so bufsize should be 10 octets bigger
+        bufsize += 10;
         sock = self.udpSock;
-        rsv = readSock(sock, 2);
+        # UDP packet should be received in one single I/O operation
+        bData, aSrcAddr = sock.recvfrom(bufsize);
+        mv = memoryview(bData);
+        rsv = mv[:2];
+        mv = mv[2:];
         if (not rsv == b'\x00' * 2):
             raise Socks5Error('rsv bytes should be all 0x00');
-        frag = readSock(sock, 1);
+        frag = mv[:1];
+        mv = mv [1:];
         if (not frag == b'\x00'):
             raise Socks5Error('FRAG field is not supported');
-        atyp = readSock(sock, 1);
+        atyp = mv[:1];
+        mv = mv[1:];
         assert atyp in mSocks5Atyp;
         if (atyp == b'\x01'):
             # ipv4 address
             nAddrLength = 4;
-            bAddr = readSock(sock, nAddrLength);
+            bAddr = mv[:nAddrLength];
+            mv = mv[nAddrLength:];
             sAddr = socket.inet_ntoa(bAddr);
         elif (atyp == b'\x03'):
             # domain name
-            nAddrLength = readSock(sock, 1);
-            bAddr = readSock(sock, nAddrLength);
+            nAddrLength = struct.unpack('>B', mv[:1])[0];
+            bAddr = mv[1:1+nAddrLength].tobytes();
+            mv = mv[1+nAddrLength:];
             sAddr = socket.gethostbyname(bAddr);
         elif (atyp == b'\x04'):
             # ipv6 address
             raise Socks5Error('ipv6 is not supported');
         else:
-            raise GeneralError('unexpected reply');
-        port = readSock(sock, 2);
-        nPort = struct.unpack('>H', port);
-        bData = sock.recv(bufsize);
-        return (bData, (sAddr, nPort));
+            raise Socks5Error('unexpected reply');
+        port = mv[:2];
+        nPort = struct.unpack('>H', port)[0];
+        bData = mv[2:].tobytes();
+        if (aSrcAddr == self.aBndAddr):
+            return (bData, (sAddr, nPort));
+        else:
+            return None;
 
     # overwrite socket methods
 
@@ -438,6 +456,8 @@ class Socks(Socket):
                 self.udpSock.bind(aBndAddr);
             elif (self.type == socket.SOCK_STREAM):
                 if (isSocks5Bind):
+                    if (self.status == _CS_INIT):
+                        self.socks5Negotiate()
                     if (self.isSocks5Bound):
                         raise Socks5Error('this socks5 socket has already been bound');
                     self.socks5Request(_SC_BIND, aBndAddr, True);
@@ -472,7 +492,7 @@ class Socks(Socket):
         elif (not self.sProxyType):
             super().connect(aAddr);
         else:
-            raise GeneralError('not expected proxy type: {}'.format(self.sProxyType))
+            raise Socks5Error('not expected proxy type: {}'.format(self.sProxyType))
         self.isConnected = True;
         return True;
 
@@ -484,7 +504,7 @@ class Socks(Socket):
 
     def getsockname(self):
         if (self.sProxyType):
-            if (self.type == socket.SOCKS_STREAM):
+            if (self.type == socket.SOCK_STREAM):
                 return self.negoSock.getsockname();
             else:
                 if (self.isSocks5Bound):
@@ -600,9 +620,10 @@ class Socks(Socket):
             return super().getsockopt(*args, **kargs);
 
     def close(self):
+        self.status = _CS_DEAD;
         super().close();
         if (self.negoSock):
-            # if the _io_refs attribute comes to 0, the underline _socket.socket object will be really closed and it will no longer be readable
+            # if the _io_refs attribute of socket object comes to 0, the underline _socket.socket object will be really closed and it will no longer be readable
             # and due to the same reason, socket object might and should still be readable even after being closed sometimes, so don't assign None to it
             self.negoSock._io_refs = self._io_refs;
             self.negoSock.close();
@@ -612,7 +633,6 @@ class Socks(Socket):
             self.udpSock.close();
             #self.udpSock = None;
         #self.realSock = None;
-        #self.status = _CS_DEAD;
 
 class Socks5HttpConnection(http.client.HTTPConnection):
     def __init__(self, *args, aAddr=None, sType=None, aAuth=None, **kargs):
@@ -628,7 +648,6 @@ class Socks5HttpConnection(http.client.HTTPConnection):
         self._create_connection = self.createRemoteDnsConnection;
     def setProxy(self, aAddr, sType=_PT_SOCKS5):
         if (aAddr):
-            #sType = sType or _PT_SOCKS5;
             self._aProxy = (aAddr, sType);
         else:
             self._aProxy = None;
@@ -690,27 +709,32 @@ def getDefaultProxy():
 
 def test():
     # suppose that socks5 server is listening on localhost, probably port 1080
+
     import sys
-    if (sys.argv[1:2]):
+    sHost = 'localhost';
+    nPort = 1081;
+    if (sys.argv[2:3]):
+        sHost = str(sys.argv[1]);
+        nPort = int(sys.argv[2]);
+    elif (sys.argv[1:2]):
         nPort = int(sys.argv[1]);
-    else:
-        nPort = 1080;
 
     print('proxied socket operation:');
     tcpSock = Socks();
-    tcpSock.setProxy(('localhost', nPort));
+    tcpSock.setProxy((sHost, nPort));
     tcpSock.connect(('myip.ipip.net', 80));
     tcpSock.sendall((b'GET / HTTP/1.1\r\nHost: myip.ipip.net\r\n\r\n'));
     print(tcpSock.recv(4096).decode());
+    tcpSock.close();
 
     print('proxy using http handler whose __init__ explictly specifies proxy server:');
-    opener = urllib.request.build_opener(Socks5HttpHandler(aAddr=('localhost', nPort)));
+    opener = urllib.request.build_opener(Socks5HttpHandler(aAddr=(sHost, nPort)));
     res = opener.open('http://myip.ipip.net/')
     print(res.read().decode())
     res.close();
 
     print('set in class level the default proxy server address');
-    setDefaultProxy(('localhost', nPort));
+    setDefaultProxy((sHost, nPort));
 
     print('proxy using https handler:');
     opener = urllib.request.build_opener(Socks5HttpsHandler);
@@ -724,17 +748,25 @@ def test():
     print(res.read().decode())
     res.close()
 
-    print('access google using proxied opener');
-    opener = urllib.request.build_opener(Socks5Handler);
-    res = opener.open('https://www.google.com/')
-    print(res.read())
-    res.close()
-
-    print('end');
+    #print('access google using proxied opener');
+    #opener = urllib.request.build_opener(Socks5Handler);
+    #res = opener.open('https://www.google.com/')
+    #print(res.read())
+    #res.close()
 
     #udpSock = Socks(socket.AF_INET, socket.SOCK_DGRAM);
-    #udpSock.setProxy(('locahost', nPort));
-    #udpSock.sendto(b'sdfds', ('google.com', 89));
+    #udpSock.setProxy((sHost, nPort));
+    #udpSock.sendto(b'sdfds', ('hostname', 7777));
+    #print(udpSock.recvfrom(4096));
+
+    #bndSock = Socks();
+    #bndSock.setProxy((sHost, nPort));
+    #bndSock.bind(('0.0.0.0', 6666), True);
+    #sock, aAddr = bndSock.accept();
+    #print(sock, aAddr);
+    #print(sock.recvfrom(4096));
+
+    print('end');
 
 if __name__ == '__main__':
     test()

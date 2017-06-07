@@ -500,15 +500,17 @@ class Socks5Connection():
             for task in self.aTasks:
                 if (not task.cancelled()):
                     self.loop.call_soon_threadsafe(task.cancel);
-            self.aTasks = [];
-            if (self.cliSock):
-                # if the cliSock is closed immediately, subsequent other socks5 connection's i/o operation may fail silently
-                self.loop.call_later(0.1, self.cliSock.close);
-            if (self.tarSock):
-                self.loop.call_later(0.1, self.tarSock.close);
-            if (self.udpSock):
-                self.udpSock.close();
-            log.debug('connection from {} closed'.format(self.aCliAddr));
+            done = self.loop.create_task(asyncio.wait(self.aTasks));
+            def cleanup(future):
+                if (self.cliSock):
+                    self.loop.call_soon_threadsafe(self.cliSock.close);
+                if (self.tarSock):
+                    self.loop.call_soon_threadsafe(self.tarSock.close);
+                if (self.udpSock):
+                    self.loop.call_soon_threadsafe(self.udpSock.close);
+                self.aTasks = [];
+                log.debug('connection from {} closed'.format(self.aCliAddr));
+            done.add_done_callback(cleanup);
             return True;
 
 class Socks5Server():

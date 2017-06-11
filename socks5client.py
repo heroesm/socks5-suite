@@ -333,6 +333,7 @@ class Socks(Socket):
             raise Socks5Error('unexpected reply');
         port = readSock(sock, 2);
         nPort = struct.unpack('>H', port)[0];
+        assert nPort != 0;
         return (sAddr, nPort);
 
     def socks5Request(self, bCmd, aDstAddr, isRemoteDns=True):

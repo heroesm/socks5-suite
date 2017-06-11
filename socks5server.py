@@ -1,6 +1,5 @@
 #! /usr/bin/env python3
 #TODO: add GSSAPI support
-#TODO: rewrite using transports or streams in separate .py file
 
 import sys
 import asyncio
@@ -194,12 +193,12 @@ class Socks5Connection():
             isDomainName = False;
             mv = mv[nAddrLength:];
         elif (atyp == DOMAINTYPE):
-            nAddrLength = struct.unpack('>B', (mv[:1]))[0];
+            nAddrLength = struct.unpack('>B', mv[:1])[0];
             sAddr = mv[1:1+nAddrLength].tobytes().decode();
             isDomainName = True;
             mv = mv[1+nAddrLength:];
         nPort = struct.unpack('>H', mv[:2])[0];
-        data = mv[2:];
+        data = mv[2:].tobytes();
         return (data, (sAddr, nPort), isDomainName);
 
     async def udpForward(self):
@@ -220,7 +219,11 @@ class Socks5Connection():
             except (BlockingIOError, InterruptedError):
                 pass
             else:
-                if (
+                if (aSrcAddr in mDstToCli):
+                    # from destination to client
+                    bData = self._wrapSocks5Udp(bData, aSrcAddr);
+                    backlogs.append((bytearray(bData), mDstToCli[aSrcAddr]));
+                elif (
                         sValidHost == aSrcAddr[0]
                         and (nValidPort == 0 or nValidPort == aSrcAddr[1])
                 ):
@@ -230,6 +233,8 @@ class Socks5Connection():
                     except Socks5Error as e:
                         # malformed socks5 udp packet; silently drop it
                         pass
+                    except Exception as e:
+                        log.error('error happened in UDP unwrapping: {}'.format(e));
                     else:
                         if (isDomainName):
                             domainQueue.put_nowait(
@@ -239,9 +244,8 @@ class Socks5Connection():
                             mDstToCli[aDstAddr] = aSrcAddr;
                             backlogs.append((bytearray(bData), aDstAddr));
                 else:
-                    # from destination to client
-                    bData = self._wrapSocks5Udp(bData, aSrcAddr);
-                    backlogs.append((bytearray(bData), mDstToCli[aSrcAddr]));
+                    # UDP packet from neither client nor target of client; silently drop it
+                    pass
                 self.loop.add_writer(self.udpSock, writer);
         def writer():
             self.udpSock.settimeout(0);
@@ -260,7 +264,11 @@ class Socks5Connection():
         async def resolveDomainName():
             while self.status != _CS_DEAD:
                 bData, aSrcAddr, aDstAddr = await domainQueue.get();
-                addr = await self.loop.getaddrinfo(*aDstAddr, family=socket.AF_INET);
+                try:
+                    addr = await self.loop.getaddrinfo(*aDstAddr, family=socket.AF_INET);
+                except socket.gaierror as e:
+                    log.debug('error in resolving domain name: {}'.format(e));
+                    continue;
                 aDstAddr = addr[0][-1];
                 mDstToCli[aDstAddr] = aSrcAddr;
                 backlogs.append((bytearray(bData), aDstAddr));
@@ -327,6 +335,7 @@ class Socks5Connection():
         self.bndSock.settimeout(0);
         try:
             # as RFC 1928, the aTarAddr should have been used to filter the address of incoming connection
+            # but it is used to designate the listening address here
             self.bndSock.bind(self.aTarAddr);
         except (PermissionError, OSError):
             pass
@@ -501,16 +510,19 @@ class Socks5Connection():
                 if (not task.cancelled()):
                     self.loop.call_soon_threadsafe(task.cancel);
             done = self.loop.create_task(asyncio.wait(self.aTasks));
-            def cleanup(future):
+            def cleanup():
                 if (self.cliSock):
-                    self.loop.call_soon_threadsafe(self.cliSock.close);
+                    self.cliSock.close();
+                if (self.bndSock):
+                    self.bndSock.close();
+                if (self.incSock):
+                    self.incSock.close();
                 if (self.tarSock):
-                    self.loop.call_soon_threadsafe(self.tarSock.close);
+                    self.tarSock.close();
                 if (self.udpSock):
-                    self.loop.call_soon_threadsafe(self.udpSock.close);
-                self.aTasks = [];
+                    self.udpSock.close();
                 log.debug('connection from {} closed'.format(self.aCliAddr));
-            done.add_done_callback(cleanup);
+            done.add_done_callback(lambda fut: self.loop.call_later(1, cleanup));
             return True;
 
 class Socks5Server():
@@ -522,7 +534,10 @@ class Socks5Server():
         self.aSrvAddr = aSrvAddr;
         self.srvSock = None;
         # preceding method in aMethods will be preferred
-        self.aMethods = aMethods or [b'\x02', b'\x00'];
+        if (aMethods):
+            self.aMethods = aMethods.copy();
+        else:
+            self.aMethods = [b'\x02', b'\x00'];
         self.sUsername = sUsername or USERNAME;
         self.sPassword = sPassword or PASSWORD;
         if (b'\x02' in self.aMethods):
@@ -562,20 +577,25 @@ class Socks5Server():
         for conn in self.aConnections:
             conn.close();
         self.aConnections = [];
+        aCancelling = [];
         for task in asyncio.Task.all_tasks():
             if (not task.cancelled()):
                 task.cancel();
-        self.loop.run_until_complete(asyncio.sleep(0));
+                aCancelling.append(task);
+        self.loop.run_until_complete(asyncio.wait(aCancelling));
+        aCancelling = [];
         self.loop.close();
+        log.info('socks5 server closed');
 
 def main():
     nPort = PORT;
     if (sys.argv[1:2]):
         nPort = int(sys.argv[1]);
     assert nPort;
+    sHost = '';
     loop = asyncio.get_event_loop();
     #loop.set_debug(True);
-    server = Socks5Server(('', nPort), loop);
+    server = Socks5Server((sHost, nPort), loop);
     server.start();
 
 if __name__ == '__main__':

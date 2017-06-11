@@ -10,10 +10,10 @@ Socks5-related scripts in Python3
 ## socks5server.py
 Socks5 server script which makes use of low level asyncio functions, supporting username/password authentication and all socks5 command including CONNECT, BIND and UDP ASSOCIATION. Not compatible with IPv6.
 
-It defaults to listening on port 1081 in all interface.
+It defaults to listening on port 1081 in all interfaces.
 
 ## socks5server_tranpsport.py
-Rewritten script of socks5server.py using relatively hight level transport and protocol in asyncio.
+Rewritten script of socks5server.py using relatively hight level asyncio transport and protocol functions.
 
 ## socks5server_stream.py
 Rewritten script of socks5server.py using hight level asyncio stream functions.

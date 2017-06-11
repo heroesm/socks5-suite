@@ -15,6 +15,9 @@ It defaults to listening on port 1081 in all interface.
 ## socks5server_tranpsport.py
 Rewritten script of socks5server.py using relatively hight level transport and protocol in asyncio.
 
+## socks5server_stream.py
+Rewritten script of socks5server.py using hight level asyncio stream functions.
+
 ## socks5client.py
 
 Socks5 client script which makes Python itself able to do socket- and http-related operations through socks5 proxy 
@@ -71,7 +74,7 @@ def test():
 
     #udpSock = Socks(socket.AF_INET, socket.SOCK_DGRAM);
     #udpSock.setProxy((sHost, nPort));
-    #udpSock.sendto(b'sdfds', ('hostname', 7777));
+    #udpSock.sendto(b'sdfds', ('localhost', 7777));
     #print(udpSock.recvfrom(4096));
 
     #bndSock = Socks();

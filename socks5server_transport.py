@@ -233,16 +233,13 @@ class TcpProtocol(asyncio.Protocol):
                 self.tipBytes = bytearray(await self.readBuffer.get());
         return bOut;
 
-    async def writeAll(self, bData, transport=None):
-        if (not transport):
-            transport = self.transport;
-        transport.write(bData);
+    async def writeAll(self, bData):
+        self.transport.write(bData);
         await self.drain();
 
 class BindProtocol(TcpProtocol):
-    def __init__(self, madeFuture, doneFuture, loop=None):
+    def __init__(self, madeFuture, loop=None):
         self.madeFuture = madeFuture;
-        self.doneFuture = doneFuture;
         self.loop = loop or asyncio.get_event_loop();
         self.aSrcAddr = None;
         self.sDstAddr = None;
@@ -260,7 +257,7 @@ class BindProtocol(TcpProtocol):
         self.transport.aDstAddr = transport.get_extra_info('peername');
         self.madeFuture.set_result(transport);
     def connection_lost(self, exc):
-        self.doneFuture.set_result(None);
+        pass
 
 class ClientProtocol(asyncio.Protocol):
 
@@ -337,10 +334,8 @@ class ClientProtocol(asyncio.Protocol):
                 self.tipBytes = bytearray(await self.readBuffer.get());
         return bOut;
 
-    async def writeAll(self, bData, transport=None):
-        if (not transport):
-            transport = self.transport;
-        transport.write(bData);
+    async def writeAll(self, bData):
+        self.transport.write(bData);
         await self.drain();
 
     def _wrapSocks5Udp(self, bData, aAddr):
@@ -419,7 +414,7 @@ class ClientProtocol(asyncio.Protocol):
             srcTrans.aDstAddr, dstTrans.aDstAddr
         ));
         while (self.status != _CS_DEAD):
-            bData = await srcTrans.readAll(65536, False);
+            bData = await srcTrans.readAll(65536, isExact=False);
             #print('relay from {} to {} : {}'.format(srcTrans.aDstAddr, dstTrans.aDstAddr));
             await dstTrans.writeAll(bData);
             if (bData == b''):
@@ -467,19 +462,19 @@ class ClientProtocol(asyncio.Protocol):
 
         log.debug('handling Bind command');
         madeFuture = self.loop.create_future();
-        doneFuture = self.loop.create_future();
         try:
             # as RFC 1928, the aTarAddr should have been used to filter the address of incoming connection
             # but it is used to designate the listening address here
             self.bndSrv = await self.loop.create_server(
-                    partial(BindProtocol, madeFuture, doneFuture, self.loop),
+                    partial(BindProtocol, madeFuture, self.loop),
                     *self.aTarAddr,
-                    family=socket.AF_INET
+                    family=socket.AF_INET,
+                    backlog=1
             );
         except (PermissionError, OSError):
             raise GeneralError('can not bind to specified address');
         else:
-            doneFuture.add_done_callback(lambda fut: self.bndSrv.close());
+            madeFuture.add_done_callback(lambda fut: self.bndSrv.close());
             return madeFuture;
 
     async def _doUdpAssociation(self):
@@ -514,7 +509,12 @@ class ClientProtocol(asyncio.Protocol):
             nAddrLength = ord(await self.readAll(1));
             bAddr = await self.readAll(nAddrLength);
             sAddr = bAddr.decode();
-            sAddr = (await self.loop.getaddrinfo(sAddr, None, family=socket.AF_INET))[0][-1][0];
+            try:
+                sAddr = (await self.loop.getaddrinfo(
+                        sAddr, None, family=socket.AF_INET
+                ))[0][-1][0];
+            except socket.gaierror as e:
+                raise Socks5Error('can not resolve domain name', b'\x04');
         elif (atyp == IPV6TYPE):
             raise Socks5Error('IPV6 address is not supported', b'\x08');
         else:
@@ -539,24 +539,24 @@ class ClientProtocol(asyncio.Protocol):
             if (self.bCommand == _SC_CONNECT):
                 await self._doConnect();
                 self.aTasks.extend([
+                    self.loop.create_task(self._sendReply(self.tarTrans.aSrcAddr)),
                     self.loop.create_task(self.tcpRelay(self.transport, self.tarTrans)),
                     self.loop.create_task(self.tcpRelay(self.tarTrans, self.transport)),
-                    self.loop.create_task(self._sendReply(self.tarTrans.aSrcAddr)),
                 ]);
             elif (self.bCommand == _SC_BIND):
                 madeFuture = await self._doBind();
                 await self._sendReply(self.bndSrv.sockets[0].getsockname());
                 self.incTrans = await madeFuture;
                 self.aTasks.extend([
+                    self.loop.create_task(self._sendReply(self.incTrans.aDstAddr)),
                     self.loop.create_task(self.tcpRelay(self.transport, self.incTrans)),
                     self.loop.create_task(self.tcpRelay(self.incTrans, self.transport)),
-                    self.loop.create_task(self._sendReply(self.incTrans.aDstAddr))
                 ]);
             elif (self.bCommand == _SC_UDP):
                 await self._doUdpAssociation();
                 self.aTasks.extend([
+                    self.loop.create_task(self._sendReply(self.udpTrans.aAddr)),
                     self.loop.create_task(self.udpForward()),
-                    self.loop.create_task(self._sendReply(self.udpTrans.aAddr))
                 ]);
             self.status = _CS_REP;
         return True;
@@ -660,7 +660,7 @@ class ClientProtocol(asyncio.Protocol):
             log.debug('connection from {} closed'.format(self.aCliAddr));
             return True;
 
-class Server():
+class Socks5Server():
     def __init__(self, aSrvAddr, loop=None, aMethods=None, sUsername=None, sPassword=None):
         self.loop = loop or asyncio.get_event_loop();
         self.server = None;
@@ -683,6 +683,7 @@ class Server():
         factory = partial(ClientProtocol, self, self.aMethods, self.loop, self.sUsername, self.sPassword);
         makeServer = self.loop.create_server(factory, sHost, nPort, family=socket.AF_INET);
         self.server = self.loop.run_until_complete(makeServer);
+        self.status = _SS_START;
         try:
             self.loop.run_forever();
         except KeyboardInterrupt as e:
@@ -698,13 +699,14 @@ class Server():
         for conn in self.aConnections:
             await conn.close();
         self.aConnections = [];
-        #aCancelling = [];
-        #for task in asyncio.Task.all_tasks():
-        #    if (not task.cancelled()):
-        #        self.loop.call_soon_threadsafe(task.cancel);
-        #        aCancelling.append(task);
-        #await asyncio.wait(aCancelling);
-        #aCancelling = [];
+        aCancelling = [];
+        for task in asyncio.Task.all_tasks():
+            if (not task.cancelled() and task is not asyncio.Task.current_task(self.loop)):
+                self.loop.call_soon_threadsafe(task.cancel);
+                aCancelling.append(task);
+        if (aCancelling):
+            await asyncio.wait(aCancelling);
+        aCancelling = [];
         log.info('socks5 server closed');
 
 def main():
@@ -712,10 +714,10 @@ def main():
     if (sys.argv[1:2]):
         nPort = int(sys.argv[1]);
     assert nPort;
+    sHost = '';
     loop = asyncio.get_event_loop();
     #loop.set_debug(True);
-    sHost = '';
-    server = Server((sHost, nPort), loop);
+    server = Socks5Server((sHost, nPort), loop);
     server.start();
 
 if __name__ == '__main__':

@@ -757,7 +757,7 @@ def test():
 
     #udpSock = Socks(socket.AF_INET, socket.SOCK_DGRAM);
     #udpSock.setProxy((sHost, nPort));
-    #udpSock.sendto(b'sdfds', ('hostname', 7777));
+    #udpSock.sendto(b'sdfds', ('localhost', 7777));
     #print(udpSock.recvfrom(4096));
 
     #bndSock = Socks();

@@ -112,34 +112,6 @@ def checkIp(sHost):
     sIpPattern = r'^(([0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])$'
     return bool(re.search(sIpPattern, sHost));
 
-async def asyncRead(sock, nSize, loop=None):
-    if (not loop):
-        loop = asyncio.get_event_loop();
-    oriTimeout = sock.gettimeout();
-    if (oriTimeout != 0):
-        sock.settimeout(0);
-    bData = b'';
-    while (len(bData) < nSize):
-        bRecv = await loop.sock_recv(sock, nSize - len(bData));
-        if (bRecv):
-            bData += bRecv;
-        else:
-            raise DeadConnectionError('socks5 connection lost');
-    sock.settimeout(oriTimeout);
-    #print('read :{}'.format(bData));
-    return bData;
-
-async def asyncWrite(sock, bData, loop=None):
-    if (not loop):
-        loop = asyncio.get_event_loop();
-    oriTimeout = sock.gettimeout();
-    if (oriTimeout != 0):
-        sock.settimeout(0);
-    loop.sock_sendall(sock, bData);
-    sock.settimeout(oriTimeout);
-    #print('write :{}'.format(bData));
-    return True;
-
 class GeneralError(Exception):
     pass
 
@@ -151,18 +123,59 @@ class Socks5Error(Exception):
         self.msg = msg;
         self.code = code;
 
+class TcpStream():
+
+    def __init__(self, reader=None, writer=None, loop=None):
+        loop = loop or asyncio.get_event_loop();
+        self.loop = loop;
+        self.reader = reader;
+        self.writer = writer;
+        if (self.writer):
+            self.aDstAddr = self.writer.get_extra_info('peername');
+            self.aBndAddr = self.writer.get_extra_info('sockname');
+
+    async def connect(self, aAddr):
+        sHost, nPort = aAddr;
+        self.reader, self.writer = await asyncio.open_connection(
+                sHost, nPort, loop=self.loop, family=socket.AF_INET
+        );
+        self.aDstAddr = self.writer.get_extra_info('peername');
+        self.aBndAddr = self.writer.get_extra_info('sockname');
+
+    async def readAll(self, bSize, isExact=True):
+        bOut = b'';
+        n = bSize - len(bOut);
+        while (n > 0):
+            bOut += await self.reader.read(n);
+            n = bSize - len(bOut);
+            if (not isExact):
+                break;
+        #print('read from {}: {}', self.aDstAddr, bOut);
+        return bOut;
+
+    async def writeAll(self, bData):
+        self.writer.write(bData);
+        #print('written to {}: {}', self.aDstAddr, bData)
+        await self.writer.drain();
+
+    def close(self):
+        self.reader.feed_eof();
+        self.writer.close();
+
 class Socks5Connection():
 
-    def __init__(self, server, cliSock, loop=None):
+    def __init__(self, server, reader, writer, loop=None):
         if (not loop):
             loop = asyncio.get_event_loop();
         self.loop = loop;
         self.server = server; # Socks5Server object
-        self.cliSock = cliSock; # socks5 negotiation socket
-        self.aCliAddr = self.cliSock.getpeername();
-        self.bndSock = None; # used in bind command as remote-bound socket
-        self.incSock = None; # used in bind command to accept incoming connection
-        self.tarSock = None; # associated with dstaddr and dstport
+        self.reader = reader;
+        self.writer = writer;
+        self.aCliAddr = self.writer.get_extra_info('sockname');
+        self.stream = TcpStream(reader, writer, loop=loop);
+        self.bndSrv = None;
+        self.incoming = None;
+        self.target = None;
         self.udpSock = None; # delegated to relay UDP packet
         self.aValidAddr = None; # permited client address in UDP association
         self.aTarAddr = None; # normally equal to (dstaddr, dstport)
@@ -171,11 +184,19 @@ class Socks5Connection():
         self.aTasks = []; # for cleanup
         self.status = _CS_INIT;
 
-    async def readAll(self, bSize):
-        return await asyncRead(self.cliSock, bSize, self.loop);
+    async def readAll(self, bSize, isExact=True):
+        bOut = b'';
+        n = bSize - len(bOut);
+        while (n > 0):
+            bOut += await self.reader.read(n);
+            n = bSize - len(bOut);
+            if (not isExact):
+                break;
+        return bOut;
 
     async def writeAll(self, bData):
-        return await asyncWrite(self.cliSock, bData, self.loop);
+        self.writer.write(bData);
+        await self.writer.drain();
 
     def _wrapSocks5Udp(self, bData, aAddr):
         rsv = b'\x00\x00';
@@ -286,17 +307,17 @@ class Socks5Connection():
                 self.loop.create_task(resolveDomainName())
         ]);
 
-    async def tcpRelay(self, srcSock, dstSock):
+    async def tcpRelay(self, source, destination):
         log.debug('starting TCP relay from {} to {}'.format(
-            srcSock.getpeername(), dstSock.getpeername()
+                source.aDstAddr, destination.aDstAddr
         ));
         while (self.status != _CS_DEAD):
-            bData = await self.loop.sock_recv(srcSock, 65536);
-            #print('relay from {} to {} : {}'.format(srcSock.getpeername(), dstSock.getpeername(), bData[:5]));
-            await self.loop.sock_sendall(dstSock, bData);
+            bData = await source.readAll(65536, isExact=False);
+            #print('relay from {} to {} : {}'.format(source.aDstAddr, destination.aDstAddr, bData[:5]));
+            await destination.writeAll(bData);
             if (bData == b''):
                 log.debug('TCP relay connection from {} to {} lost'.format(
-                    srcSock.getpeername(), dstSock.getpeername()
+                        source.aDstAddr, destination.aDstAddr
                 ));
                 break;
         self.loop.create_task(self.close());
@@ -326,29 +347,38 @@ class Socks5Connection():
     async def _doConnect(self):
         log.debug('handling Connect command');
         assert (self.bCommand == _SC_CONNECT);
-        self.tarSock = socket.socket();
-        self.tarSock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1);
-        self.tarSock.settimeout(0);
-        await self.loop.sock_connect(self.tarSock, self.aTarAddr);
+        self.target = TcpStream(loop=self.loop);
+        await self.target.connect(self.aTarAddr);
 
     async def _doBind(self):
         # this bind implementation does not conform to RFC 1928
         # it functions literally like remote-binding
 
-        # indeed not asynchronous
         log.debug('handling Bind command');
-        self.bndSock = socket.socket();
-        self.bndSock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1);
-        self.bndSock.settimeout(0);
+        madeFuture = self.loop.create_future();
+        def accept(reader, writer):
+            stream = TcpStream(reader, writer, loop=self.loop);
+            madeFuture.set_result(stream);
         try:
             # as RFC 1928, the aTarAddr should have been used to filter the address of incoming connection
             # but it is used to designate the listening address here
-            self.bndSock.bind(self.aTarAddr);
+            self.bndSrv = await asyncio.start_server(
+                    accept,
+                    *self.aTarAddr,
+                    loop=self.loop,
+                    family=socket.AF_INET,
+                    backlog=1
+            );
         except (PermissionError, OSError):
-            pass
-        self.bndSock.listen(0);
+            raise GeneralError('can not bind to specified address');
+        else:
+            madeFuture.add_done_callback(lambda fut: self.bndSrv.close());
+            return madeFuture;
 
     async def _doUdpAssociation(self):
+        # there are no UDP suport in asyncio stream
+        # so still use the low level asyncio socket operation
+
         # indeed not asynchronous
         log.debug('handling UDP Association');
         self.udpSock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM);
@@ -412,18 +442,18 @@ class Socks5Connection():
             if (self.bCommand == _SC_CONNECT):
                 await self._doConnect();
                 self.aTasks.extend([
-                    self.loop.create_task(self._sendReply(self.tarSock.getsockname())),
-                    self.loop.create_task(self.tcpRelay(self.cliSock, self.tarSock)),
-                    self.loop.create_task(self.tcpRelay(self.tarSock, self.cliSock)),
+                    self.loop.create_task(self._sendReply(self.target.aBndAddr)),
+                    self.loop.create_task(self.tcpRelay(self.stream, self.target)),
+                    self.loop.create_task(self.tcpRelay(self.target, self.stream)),
                 ]);
             elif (self.bCommand == _SC_BIND):
-                await self._doBind();
-                await self._sendReply(self.bndSock.getsockname());
-                self.incSock, aIncAddr = await self.loop.sock_accept(self.bndSock);
+                madeFuture = await self._doBind();
+                await self._sendReply(self.bndSrv.sockets[0].getsockname());
+                self.incoming = await madeFuture;
                 self.aTasks.extend([
-                    self.loop.create_task(self._sendReply(aIncAddr)),
-                    self.loop.create_task(self.tcpRelay(self.cliSock, self.incSock)),
-                    self.loop.create_task(self.tcpRelay(self.incSock, self.cliSock)),
+                    self.loop.create_task(self._sendReply(self.incoming.aDstAddr)),
+                    self.loop.create_task(self.tcpRelay(self.stream, self.incoming)),
+                    self.loop.create_task(self.tcpRelay(self.incoming, self.stream)),
                 ]);
             elif (self.bCommand == _SC_UDP):
                 await self._doUdpAssociation();
@@ -514,24 +544,24 @@ class Socks5Connection():
         else:
             log.debug('closing connection from {}'.format(self.aCliAddr));
             self.status = _CS_DEAD;
+            if (self.udpSock):
+                self.loop.remove_reader(self.udpSock);
+                self.loop.remove_writer(self.udpSock);
+            if (self.bndSrv):
+                self.bndSrv.close();
+            if (self.stream):
+                self.stream.close();
+            if (self.incoming):
+                self.incoming.close();
+            if (self.target):
+                self.target.close();
             if (self.aTasks):
                 for task in self.aTasks:
                     if (not task.cancelled()):
                         self.loop.call_soon_threadsafe(task.cancel);
                 await asyncio.wait(self.aTasks);
             if (self.udpSock):
-                self.loop.remove_reader(self.udpSock);
-                self.loop.remove_writer(self.udpSock);
-            if (self.cliSock):
-                self.loop.call_soon_threadsafe(self.cliSock.close);
-            if (self.bndSock):
-                self.loop.call_soon_threadsafe(self.bndSock.close);
-            if (self.incSock):
-                self.loop.call_soon_threadsafe(self.incSock.close);
-            if (self.tarSock):
-                self.loop.call_soon_threadsafe(self.tarSock.close);
-            if (self.udpSock):
-                self.loop.call_soon_threadsafe(self.udpSock.close);
+                self.udpSock.close();
             log.debug('connection from {} closed'.format(self.aCliAddr));
             return True;
 
@@ -541,8 +571,8 @@ class Socks5Server():
         if (not loop):
             loop = asyncio.get_event_loop();
         self.loop = loop;
+        self.server = None;
         self.aSrvAddr = aSrvAddr;
-        self.srvSock = None;
         # preceding method in aMethods will be preferred
         if (aMethods):
             self.aMethods = aMethods.copy();
@@ -556,22 +586,16 @@ class Socks5Server():
         self.aConnections = [];
         self.status = _SS_INIT;
 
-    async def listen(self):
-        log.info('socks5 server lisening on {}'.format(self.srvSock.getsockname()));
-        while self.status !=_SS_CLOSE:
-            (cliSock, aCliAddr) = await self.loop.sock_accept(self.srvSock);
-            socks5Conn = Socks5Connection(self, cliSock, self.loop);
-            self.aConnections.append(socks5Conn);
-            self.loop.create_task(socks5Conn.start());
+    def handleConn(self, reader, writer):
+        socks5Conn = Socks5Connection(self, reader, writer, loop=self.loop);
+        self.aConnections.append(socks5Conn);
+        self.loop.create_task(socks5Conn.start());
 
     def start(self):
-        if (not self.srvSock):
-            self.srvSock = socket.socket();
-        self.srvSock.settimeout(0);
-        self.srvSock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1);
-        self.srvSock.bind(self.aSrvAddr);
-        self.srvSock.listen(500);
-        self.loop.create_task(self.listen());
+        self.server = self.loop.run_until_complete(asyncio.start_server(
+                self.handleConn, *self.aSrvAddr, loop=self.loop, family=socket.AF_INET
+        ));
+        log.info('socks5 server lisening on {}'.format(self.aSrvAddr));
         self.status = _SS_START;
         try:
             self.loop.run_forever();
@@ -582,9 +606,10 @@ class Socks5Server():
             self.loop.close();
 
     def close(self):
+        # to be modified
         log.info('closing socks5 server...');
         self.status = _SS_CLOSE;
-        self.srvSock.close();
+        self.server.close();
         aClosing = [];
         for conn in self.aConnections:
             aClosing.append(self.loop.create_task(conn.close()));
@@ -597,7 +622,8 @@ class Socks5Server():
             if (not task.cancelled()):
                 task.cancel();
                 aCancelling.append(task);
-        self.loop.run_until_complete(asyncio.wait(aCancelling));
+        if (aCancelling):
+            self.loop.run_until_complete(asyncio.wait(aCancelling));
         aCancelling = [];
         log.info('socks5 server closed');
 

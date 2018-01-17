@@ -117,6 +117,8 @@ class Socks(Socket):
         assert family == socket.AF_INET;
         assert type in (socket.SOCK_STREAM, socket.SOCK_DGRAM);
         super().__init__(family, type, proto);
+        # if sock.settimeout(x) with not None value as x, sock.type will be <SocketKind.SOCK_NONBLOCK: 2048>, not the originally <SocketKind.SOCK_RAW: 3>, <SocketKind.SOCK_DGRAM: 2>. So it's necessary to manually save the type to discern in the future.
+        self._type = type;
         self.negoSock = None;
         self.udpSock = None;
         self.realSock = None;
@@ -170,10 +172,10 @@ class Socks(Socket):
             self.aSrvAddr = aSrvAddr;
             self.sProxyType = sType;
             self.negoSock = Socket(socket.AF_INET, socket.SOCK_STREAM);
-            if (self.type == socket.SOCK_DGRAM):
+            if (self._type == socket.SOCK_DGRAM):
                 self.udpSock = Socket(socket.AF_INET, socket.SOCK_DGRAM);
                 self.realSock = self.udpSock;
-            elif (self.type == socket.SOCK_STREAM):
+            elif (self._type == socket.SOCK_STREAM):
                 self.realSock = self.negoSock;
             return True;
         else:
@@ -349,7 +351,7 @@ class Socks(Socket):
         #o  if ATYP is X'03' - 262+method_dependent octets smaller
         #o  if ATYP is X'04' - 20+method_dependent octets smaller):
         assert self.sProxyType == _PT_SOCKS5;
-        assert self.type == socket.SOCK_DGRAM;
+        assert self._type == socket.SOCK_DGRAM;
         assert self.udpSock;
         if (self.status == _CS_INIT):
             self.socks5Negotiate()
@@ -383,7 +385,7 @@ class Socks(Socket):
         #o  if ATYP is X'03' - 262+method_dependent octets smaller
         #o  if ATYP is X'04' - 20+method_dependent octets smaller):
         assert self.sProxyType == _PT_SOCKS5;
-        assert self.type == socket.SOCK_DGRAM;
+        assert self._type == socket.SOCK_DGRAM;
         assert self.udpSock;
         assert self.status == _CS_REP;
         # suppose the socks5 server only return ip address type, so bufsize should be 10 octets bigger
@@ -452,10 +454,10 @@ class Socks(Socket):
         # socks5 binding is not tested
         assert not self.isBound;
         if (self.sProxyType == _PT_SOCKS5):
-            if (self.type == socket.SOCK_DGRAM):
+            if (self._type == socket.SOCK_DGRAM):
                 assert self.udpSock;
                 self.udpSock.bind(aBndAddr);
-            elif (self.type == socket.SOCK_STREAM):
+            elif (self._type == socket.SOCK_STREAM):
                 if (isSocks5Bind):
                     if (self.status == _CS_INIT):
                         self.socks5Negotiate()
@@ -476,12 +478,12 @@ class Socks(Socket):
             assert self.aSrvAddr;
             if (self.status == _CS_INIT):
                 self.socks5Negotiate()
-            if (self.type == socket.SOCK_STREAM):
+            if (self._type == socket.SOCK_STREAM):
                 # tcp
                 assert not self.isConnected and not self.isSocks5Bound;
                 self.socks5Request(_SC_CONNECT, aAddr, self.isRemoteDns);
                 self.realSock = self.negoSock;
-            elif (self.type == socket.SOCK_DGRAM):
+            elif (self._type == socket.SOCK_DGRAM):
                 # udp
                 assert self.udpSock;
                 if (self.status == _CS_NEGO):
@@ -505,7 +507,7 @@ class Socks(Socket):
 
     def getsockname(self):
         if (self.sProxyType):
-            if (self.type == socket.SOCK_STREAM):
+            if (self._type == socket.SOCK_STREAM):
                 return self.negoSock.getsockname();
             else:
                 if (self.isSocks5Bound):
@@ -518,11 +520,11 @@ class Socks(Socket):
     def recv(self, bufsize, *args, **kargs):
         'the maximum bufsize will be smaller than the original system limit due to additional socks5 header';
         if (self.sProxyType == _PT_SOCKS5):
-            if (self.type == socket.SOCK_DGRAM):
+            if (self._type == socket.SOCK_DGRAM):
                 assert self.status == _CS_REP;
                 bData, _ =  self._recvUdp(bufsize);
                 return bData;
-            elif (self.type == socket.SOCK_STREAM):
+            elif (self._type == socket.SOCK_STREAM):
                 assert self.status in (_CS_REP, _CS_BND_SECOND);
                 return self.negoSock.recv(bufsize, *args, **kargs);
         elif (not self.sProxyType):
@@ -530,11 +532,11 @@ class Socks(Socket):
 
     def recvfrom(self, bufsize, *args, **kargs):
         if (self.sProxyType == _PT_SOCKS5):
-            if (self.type == socket.SOCK_DGRAM):
+            if (self._type == socket.SOCK_DGRAM):
                 assert self.status == _CS_REP;
                 bData, aAddr = self._recvUdp(bufsize);
                 return (bData, aAddr);
-            elif (self.type == socket.SOCK_STREAM):
+            elif (self._type == socket.SOCK_STREAM):
                 assert self.status in (_CS_REP, _CS_BND_SECOND);
                 return self.negoSock.recvfrom(bufsize, *args, **kargs);
         elif (not self.sProxyType):
@@ -545,7 +547,7 @@ class Socks(Socket):
         if (not nbytes):
             nbytes = 0;
         if (self.sProxyType == _PT_SOCKS5):
-            if (self.type == socket.SOCK_DGRAM):
+            if (self._type == socket.SOCK_DGRAM):
                 assert self.status == _CS_REP;
                 if (nbytes > 0 and len(buffer) > nbytes):
                     nSize = nbytes;
@@ -554,7 +556,7 @@ class Socks(Socket):
                 bData, _ =  self._recvUdp(nSize);
                 buffer[:nSize] = bData;
                 return nSize;
-            elif (self.type == socket.SOCK_STREAM):
+            elif (self._type == socket.SOCK_STREAM):
                 assert self.status in (_CS_REP, _CS_BND_SECOND);
                 return self.negoSock.recv_into(buffer, nbytes, *args, **kargs);
         elif (not self.sProxyType):
@@ -563,9 +565,9 @@ class Socks(Socket):
     def send(self, bData):
         if (self.sProxyType == _PT_SOCKS5):
             assert self.isConnected;
-            if (self.type == socket.SOCK_DGRAM):
+            if (self._type == socket.SOCK_DGRAM):
                 return self._sendUdp(bData, self.aDstAddr);
-            elif (self.type == socket.SOCK_STREAM):
+            elif (self._type == socket.SOCK_STREAM):
                 assert self.status in (_CS_REP, _CS_BND_SECOND);
                 return self.negoSock.send(bData);
         else:
@@ -574,9 +576,9 @@ class Socks(Socket):
     def sendall(self, bData):
         if (self.sProxyType == _PT_SOCKS5):
             assert self.isConnected;
-            if (self.type == socket.SOCK_DGRAM):
+            if (self._type == socket.SOCK_DGRAM):
                 return self._sendUdp(bData, self.aDstAddr);
-            elif (self.type == socket.SOCK_STREAM):
+            elif (self._type == socket.SOCK_STREAM):
                 assert self.status in (_CS_REP, _CS_BND_SECOND);
                 return self.negoSock.sendall(bData);
         else:
@@ -584,9 +586,9 @@ class Socks(Socket):
 
     def sendto(self, bData, aAddr):
         if (self.sProxyType == _PT_SOCKS5):
-            if (self.type == socket.SOCK_DGRAM):
+            if (self._type == socket.SOCK_DGRAM):
                 return self._sendUdp(bData, aAddr);
-            elif (self.type == socket.SOCK_STREAM):
+            elif (self._type == socket.SOCK_STREAM):
                 assert self.status in (_CS_REP, _CS_BND_SECOND);
                 self.negoSock.send(bData);
         elif (not self.sProxyType):
@@ -709,7 +711,7 @@ def getDefaultProxy():
     return Socks.aDefaultProxy;
 
 def test():
-    # suppose that socks5 server is listening on localhost, probably port 1080
+    # suppose that socks5 server is listening on localhost, probably port 1081
 
     import sys
     sHost = 'localhost';

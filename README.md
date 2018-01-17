@@ -13,10 +13,10 @@ Socks5 server script which makes use of low level asyncio functions, supporting 
 It defaults to listening on port 1081 in all interfaces.
 
 ## socks5server_tranpsport.py
-Rewritten script of socks5server.py using relatively hight level asyncio transport and protocol functions.
+Rewritten script of socks5server.py using relatively high level asyncio transport and protocol functions.
 
 ## socks5server_stream.py
-Rewritten script of socks5server.py using hight level asyncio stream functions.
+Rewritten script of socks5server.py using high level asyncio stream functions.
 
 ## socks5client.py
 
